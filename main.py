@@ -1,5 +1,6 @@
 import asyncio
 import io
+import json
 import os
 import re
 from contextlib import asynccontextmanager
@@ -9,7 +10,7 @@ from typing import Optional
 import torch
 from diffusers import AutoPipelineForText2Image
 from fastapi import FastAPI, Form, HTTPException
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 import uvicorn
 
@@ -71,7 +72,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Text-to-Image Web App",
-    description="Generate high quality images from text prompts using SDXL on Apple Silicon / CUDA.",
+    description="Generate high quality images from text prompts using SDXL with real-time SSE streaming.",
     lifespan=lifespan,
 )
 
@@ -84,7 +85,7 @@ class GenerateRequest(BaseModel):
 
 
 def _run_inference(prompt: str, steps: int, guidance: float, save_path: Path) -> bytes:
-    """Synchronous inference function to run in worker thread."""
+    """Synchronous inference function to run in worker thread for direct responses."""
     result = pipeline(
         prompt=prompt,
         num_inference_steps=steps,
@@ -100,9 +101,94 @@ def _run_inference(prompt: str, steps: int, guidance: float, save_path: Path) ->
     return img_byte_arr.getvalue()
 
 
+def _run_inference_stream(
+    prompt: str,
+    steps: int,
+    guidance: float,
+    save_path: Path,
+    loop: asyncio.AbstractEventLoop,
+    progress_queue: asyncio.Queue,
+) -> Path:
+    """Synchronous inference with step callback feeding progress into an async queue."""
+    def step_callback(pipe, step_index, timestep, callback_kwargs):
+        progress = {
+            "status": "generating",
+            "step": step_index + 1,
+            "total_steps": steps,
+            "percentage": round(((step_index + 1) / steps) * 100, 1),
+        }
+        loop.call_soon_threadsafe(progress_queue.put_nowait, progress)
+        return callback_kwargs
+
+    result = pipeline(
+        prompt=prompt,
+        num_inference_steps=steps,
+        guidance_scale=guidance,
+        callback_on_step_end=step_callback,
+    ).images[0]
+
+    result.save(save_path, format="PNG")
+    return save_path
+
+
+async def event_generator(prompt: str, steps: int, guidance: float, filename: str):
+    """Async generator yielding Server-Sent Events (SSE) representing generation progress."""
+    if pipeline is None:
+        yield f"data: {json.dumps({'status': 'error', 'message': 'Model is not loaded or initializing.'})}\n\n"
+        return
+
+    safe_filename = sanitize_filename(filename)
+    save_path = OUTPUT_DIR / safe_filename
+
+    loop = asyncio.get_running_loop()
+    progress_queue: asyncio.Queue = asyncio.Queue()
+
+    yield f"data: {json.dumps({'status': 'queued', 'message': 'Waiting for GPU/MPS device lock...', 'percentage': 0})}\n\n"
+
+    async with generation_lock:
+        yield f"data: {json.dumps({'status': 'starting', 'message': 'Starting inference on device...', 'percentage': 0})}\n\n"
+
+        task = asyncio.create_task(
+            asyncio.to_thread(
+                _run_inference_stream,
+                prompt=prompt,
+                steps=steps,
+                guidance=guidance,
+                save_path=save_path,
+                loop=loop,
+                progress_queue=progress_queue,
+            )
+        )
+
+        while not task.done() or not progress_queue.empty():
+            try:
+                progress = await asyncio.wait_for(progress_queue.get(), timeout=0.1)
+                yield f"data: {json.dumps(progress)}\n\n"
+            except asyncio.TimeoutError:
+                await asyncio.sleep(0.01)
+
+        try:
+            await task
+            completion = {
+                "status": "completed",
+                "step": steps,
+                "total_steps": steps,
+                "percentage": 100.0,
+                "filename": safe_filename,
+                "image_url": f"/images/{safe_filename}",
+            }
+            yield f"data: {json.dumps(completion)}\n\n"
+        except Exception as e:
+            error_data = {
+                "status": "error",
+                "message": str(e),
+            }
+            yield f"data: {json.dumps(error_data)}\n\n"
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    """Web interface with prompt, filename, parameters, and interactive preview."""
+    """Web interface with prompt, filename, parameters, and interactive SSE stream preview."""
     device, dtype = get_optimal_device_and_dtype()
     device_label = "Apple Silicon (MPS)" if device == "mps" else ("NVIDIA GPU (CUDA)" if device == "cuda" else "CPU")
 
@@ -253,6 +339,7 @@ async def index():
             border-radius: 0.75rem;
             position: relative;
             overflow: hidden;
+            padding: 1rem;
         }}
         .preview-image {{
             max-width: 100%;
@@ -280,9 +367,25 @@ async def index():
             0% {{ transform: rotate(0deg); }}
             100% {{ transform: rotate(360deg); }}
         }}
+        .progress-bar-container {{
+            display: none;
+            width: 80%;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 9999px;
+            height: 8px;
+            overflow: hidden;
+            margin-bottom: 1rem;
+        }}
+        .progress-bar {{
+            width: 0%;
+            height: 100%;
+            background: linear-gradient(90deg, #6366f1, #c084fc);
+            transition: width 0.2s ease;
+        }}
         .status-text {{
             font-size: 0.9rem;
             color: var(--text-muted);
+            text-align: center;
         }}
         .download-btn {{
             margin-top: 1rem;
@@ -305,7 +408,7 @@ async def index():
     <div class="container">
         <header>
             <h1>Text to Image Studio</h1>
-            <p style="color: var(--text-muted);">Stable Diffusion XL Web Application</p>
+            <p style="color: var(--text-muted);">Stable Diffusion XL Web Application with Live SSE Stream</p>
             <div class="badge">Hardware Acceleration: {device_label}</div>
         </header>
 
@@ -347,6 +450,9 @@ async def index():
                 <label>Generated Result</label>
                 <div class="preview-container">
                     <div class="spinner" id="spinner"></div>
+                    <div class="progress-bar-container" id="progress-container">
+                        <div class="progress-bar" id="progress-bar"></div>
+                    </div>
                     <div class="status-text" id="status-text">Your generated image will appear here</div>
                     <img id="preview" class="preview-image" alt="Generated result" />
                 </div>
@@ -359,6 +465,8 @@ async def index():
         const form = document.getElementById('gen-form');
         const submitBtn = document.getElementById('submit-btn');
         const spinner = document.getElementById('spinner');
+        const progressContainer = document.getElementById('progress-container');
+        const progressBar = document.getElementById('progress-bar');
         const statusText = document.getElementById('status-text');
         const preview = document.getElementById('preview');
         const downloadLink = document.getElementById('download-link');
@@ -374,7 +482,10 @@ async def index():
             // UI loading state
             submitBtn.disabled = true;
             spinner.style.display = 'block';
-            statusText.textContent = 'Generating on Apple Silicon... Please wait...';
+            progressContainer.style.display = 'block';
+            progressBar.style.width = '0%';
+            statusText.style.display = 'block';
+            statusText.textContent = 'Connecting to server stream...';
             preview.style.display = 'none';
             downloadLink.style.display = 'none';
 
@@ -385,29 +496,62 @@ async def index():
                 formData.append('num_inference_steps', steps);
                 formData.append('guidance_scale', guidance);
 
-                const response = await fetch('/generate', {{
+                const response = await fetch('/generate-stream', {{
                     method: 'POST',
                     body: formData
                 }});
 
                 if (!response.ok) {{
-                    const err = await response.json();
-                    throw new Error(err.detail || 'Generation failed');
+                    throw new Error('Server error: ' + response.status + ' ' + response.statusText);
                 }}
 
-                const blob = await response.blob();
-                const imageUrl = URL.createObjectURL(blob);
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder('utf-8');
+                let buffer = '';
 
-                preview.src = imageUrl;
-                preview.style.display = 'block';
-                spinner.style.display = 'none';
-                statusText.style.display = 'none';
+                while (true) {{
+                    const {{ done, value }} = await reader.read();
+                    if (done) break;
 
-                downloadLink.href = imageUrl;
-                downloadLink.download = filename.endsWith('.png') ? filename : filename + '.png';
-                downloadLink.style.display = 'inline-block';
+                    buffer += decoder.decode(value, {{ stream: true }});
+                    const lines = buffer.split('\\n');
+                    buffer = lines.pop(); // keep last incomplete line
+
+                    for (const line of lines) {{
+                        const trimmed = line.trim();
+                        if (trimmed.startsWith('data: ')) {{
+                            const data = JSON.parse(trimmed.substring(6));
+
+                            if (data.status === 'queued') {{
+                                statusText.textContent = data.message || 'Queued for generation...';
+                            }} else if (data.status === 'starting') {{
+                                statusText.textContent = data.message || 'Starting inference...';
+                                progressBar.style.width = '2%';
+                            }} else if (data.status === 'generating') {{
+                                statusText.textContent = `Denoising step ${{data.step}} of ${{data.total_steps}} (${{data.percentage}}%)`;
+                                progressBar.style.width = `${{data.percentage}}%`;
+                            }} else if (data.status === 'completed') {{
+                                progressBar.style.width = '100%';
+                                statusText.textContent = 'Generation complete!';
+                                
+                                // Display image preview
+                                preview.src = data.image_url + '?t=' + new Date().getTime();
+                                preview.style.display = 'block';
+                                spinner.style.display = 'none';
+                                progressContainer.style.display = 'none';
+
+                                downloadLink.href = data.image_url;
+                                downloadLink.download = data.filename;
+                                downloadLink.style.display = 'inline-block';
+                            }} else if (data.status === 'error') {{
+                                throw new Error(data.message || 'Unknown generation error');
+                            }}
+                        }}
+                    }}
+                }}
             }} catch (err) {{
                 spinner.style.display = 'none';
+                progressContainer.style.display = 'none';
                 statusText.style.display = 'block';
                 statusText.textContent = 'Error: ' + err.message;
             }} finally {{
@@ -421,6 +565,63 @@ async def index():
     return HTMLResponse(content=html_content)
 
 
+@app.get("/images/{filename}")
+async def get_image(filename: str):
+    """Retrieve saved image from local disk."""
+    safe_filename = sanitize_filename(filename)
+    image_path = OUTPUT_DIR / safe_filename
+    if not image_path.exists():
+        raise HTTPException(status_code=404, detail="Image not found")
+    return FileResponse(
+        path=image_path,
+        media_type="image/png",
+        filename=safe_filename,
+    )
+
+
+@app.post("/generate-stream")
+async def generate_stream_form(
+    prompt: str = Form(...),
+    filename: str = Form("output.png"),
+    num_inference_steps: int = Form(30),
+    guidance_scale: float = Form(7.5),
+):
+    """Form endpoint returning an SSE stream of generation status and final image URL."""
+    return StreamingResponse(
+        event_generator(
+            prompt=prompt,
+            steps=num_inference_steps,
+            guidance=guidance_scale,
+            filename=filename,
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.post("/api/generate-stream")
+async def generate_stream_api(request: GenerateRequest):
+    """JSON API endpoint returning an SSE stream of generation status and final image URL."""
+    return StreamingResponse(
+        event_generator(
+            prompt=request.prompt,
+            steps=request.num_inference_steps,
+            guidance=request.guidance_scale,
+            filename=request.filename or "output.png",
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.post("/generate", response_class=Response)
 async def generate_image(
     prompt: str = Form(...),
@@ -428,16 +629,13 @@ async def generate_image(
     num_inference_steps: int = Form(30),
     guidance_scale: float = Form(7.5),
 ):
-    """
-    Accepts prompt, filename, and inference parameters, saves to disk and returns the PNG image.
-    """
+    """Accepts prompt, filename, and inference parameters, saves to disk and returns the PNG image."""
     if pipeline is None:
         raise HTTPException(status_code=503, detail="Model is still initializing or unavailable.")
 
     safe_filename = sanitize_filename(filename)
     save_path = OUTPUT_DIR / safe_filename
 
-    # Ensure concurrent requests are handled safely without overloading MPS VRAM
     async with generation_lock:
         image_bytes = await asyncio.to_thread(
             _run_inference,
