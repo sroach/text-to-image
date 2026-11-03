@@ -55,7 +55,7 @@ async def lifespan(app: FastAPI):
 
     pipeline = AutoPipelineForText2Image.from_pretrained(
         "stabilityai/stable-diffusion-xl-base-1.0",
-        dtype=dtype,
+        torch_dtype=dtype,
         use_safetensors=True,
     )
     pipeline.to(device)
