@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 import torch
-from diffusers import AutoPipelineForText2Image
+from diffusers import AutoPipelineForText2Image, AutoencoderKL
 from fastapi import FastAPI, Form, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
@@ -54,16 +54,26 @@ async def lifespan(app: FastAPI):
     device, dtype = get_optimal_device_and_dtype()
     print(f"🚀 Loading diffusion model on device: {device.upper()} with dtype: {dtype}...")
 
+    # On Apple Silicon (MPS), replace the default SDXL VAE with a fixed version.
+    # The default SDXL VAE produces NaN/Inf values on MPS, resulting in black images.
+    # The community-patched VAE (madebyollin/sdxl-vae-fp16-fix) works correctly in float16 on MPS.
+    vae = None
+    if device == "mps":
+        print("🔄 Loading MPS-compatible VAE (madebyollin/sdxl-vae-fp16-fix)...")
+        vae = AutoencoderKL.from_pretrained(
+            "madebyollin/sdxl-vae-fp16-fix",
+            torch_dtype=dtype,
+        )
+
     pipeline = AutoPipelineForText2Image.from_pretrained(
         "stabilityai/stable-diffusion-xl-base-1.0",
         torch_dtype=dtype,
+        vae=vae,
         use_safetensors=True,
     )
-    pipeline.to(device)
 
-    # Memory optimization for Apple Silicon / consumer hardware
-    if device == "mps":
-        pipeline.enable_attention_slicing()
+    # Move entire pipeline to device - all components share the same dtype
+    pipeline.to(device)
 
     print("✅ Model loaded and ready for inference!")
     yield
@@ -79,18 +89,31 @@ app = FastAPI(
 
 class GenerateRequest(BaseModel):
     prompt: str = Field(..., description="Text prompt describing the desired image")
+    negative_prompt: Optional[str] = Field(None, description="Things to exclude from the image")
     filename: Optional[str] = Field("output.png", description="Filename for the saved PNG")
     num_inference_steps: int = Field(30, ge=1, le=100, description="Number of denoising steps")
     guidance_scale: float = Field(7.5, ge=0.0, le=20.0, description="Classifier-free guidance scale")
+    width: Optional[int] = Field(None, ge=256, le=2048, description="Image width (SDXL default: 1024)")
+    height: Optional[int] = Field(None, ge=256, le=2048, description="Image height (SDXL default: 1024)")
 
 
-def _run_inference(prompt: str, steps: int, guidance: float, save_path: Path) -> bytes:
+def _run_inference(
+    prompt: str, steps: int, guidance: float, save_path: Path,
+    negative_prompt: Optional[str] = None, width: Optional[int] = None, height: Optional[int] = None,
+) -> bytes:
     """Synchronous inference function to run in worker thread for direct responses."""
-    result = pipeline(
-        prompt=prompt,
-        num_inference_steps=steps,
-        guidance_scale=guidance,
-    ).images[0]
+    kwargs = {
+        "prompt": prompt,
+        "num_inference_steps": steps,
+        "guidance_scale": guidance,
+    }
+    if negative_prompt:
+        kwargs["negative_prompt"] = negative_prompt
+    if width:
+        kwargs["width"] = width
+    if height:
+        kwargs["height"] = height
+    result = pipeline(**kwargs).images[0]
 
     # Save to local disk
     result.save(save_path, format="PNG")
@@ -108,6 +131,9 @@ def _run_inference_stream(
     save_path: Path,
     loop: asyncio.AbstractEventLoop,
     progress_queue: asyncio.Queue,
+    negative_prompt: Optional[str] = None,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
 ) -> Path:
     """Synchronous inference with step callback feeding progress into an async queue."""
     def step_callback(pipe, step_index, timestep, callback_kwargs):
@@ -120,18 +146,28 @@ def _run_inference_stream(
         loop.call_soon_threadsafe(progress_queue.put_nowait, progress)
         return callback_kwargs
 
-    result = pipeline(
-        prompt=prompt,
-        num_inference_steps=steps,
-        guidance_scale=guidance,
-        callback_on_step_end=step_callback,
-    ).images[0]
+    kwargs = {
+        "prompt": prompt,
+        "num_inference_steps": steps,
+        "guidance_scale": guidance,
+        "callback_on_step_end": step_callback,
+    }
+    if negative_prompt:
+        kwargs["negative_prompt"] = negative_prompt
+    if width:
+        kwargs["width"] = width
+    if height:
+        kwargs["height"] = height
+    result = pipeline(**kwargs).images[0]
 
     result.save(save_path, format="PNG")
     return save_path
 
 
-async def event_generator(prompt: str, steps: int, guidance: float, filename: str):
+async def event_generator(
+    prompt: str, steps: int, guidance: float, filename: str,
+    negative_prompt: Optional[str] = None, width: Optional[int] = None, height: Optional[int] = None,
+):
     """Async generator yielding Server-Sent Events (SSE) representing generation progress."""
     if pipeline is None:
         yield f"data: {json.dumps({'status': 'error', 'message': 'Model is not loaded or initializing.'})}\n\n"
@@ -157,6 +193,9 @@ async def event_generator(prompt: str, steps: int, guidance: float, filename: st
                 save_path=save_path,
                 loop=loop,
                 progress_queue=progress_queue,
+                negative_prompt=negative_prompt,
+                width=width,
+                height=height,
             )
         )
 
@@ -402,6 +441,26 @@ async def index():
         .download-btn:hover {{
             background: #059669;
         }}
+        .aspect-btn {{
+            background: var(--input-bg);
+            color: var(--text-main);
+            border: 1px solid var(--border);
+            border-radius: 0.5rem;
+            padding: 0.5rem;
+            font-size: 0.85rem;
+            cursor: pointer;
+            transition: all 0.2s;
+            width: 100%;
+        }}
+        .aspect-btn:hover {{
+            border-color: var(--accent);
+            background: rgba(99, 102, 241, 0.1);
+        }}
+        .aspect-btn.active {{
+            border-color: var(--accent);
+            background: rgba(99, 102, 241, 0.2);
+            color: #a5b4fc;
+        }}
     </style>
 </head>
 <body>
@@ -421,9 +480,38 @@ async def index():
                     </div>
 
                     <div class="form-group">
+                        <label for="negative-prompt">Negative Prompt</label>
+                        <textarea id="negative-prompt" name="negative_prompt" rows="2" placeholder="What to exclude: text, watermark, logo, dark, gloomy...">text, watermark, logo, blurry, low quality</textarea>
+                        <div class="hint">Things you don't want in the image — comma-separated works best.</div>
+                    </div>
+
+                    <div class="form-group">
                         <label for="filename">Filename</label>
                         <input type="text" id="filename" name="filename" value="artwork.png" placeholder="e.g. artwork.png">
                         <div class="hint">The generated image will be saved locally & returned with this name.</div>
+                    </div>
+
+                    <div class="form-group">
+                        <label>Aspect Ratio</label>
+                        <div class="row" style="grid-template-columns: 1fr 1fr 1fr;">
+                            <button type="button" class="aspect-btn" onclick="setAspect(1024,1024)" style="font-size:0.85rem;padding:0.5rem;">1:1 Square</button>
+                            <button type="button" class="aspect-btn" onclick="setAspect(1344,768)" style="font-size:0.85rem;padding:0.5rem;">16:9 Wide</button>
+                            <button type="button" class="aspect-btn" onclick="setAspect(768,1344)" style="font-size:0.85rem;padding:0.5rem;">9:16 Tall</button>
+                        </div>
+                    </div>
+
+                    <div class="row">
+                        <div class="form-group">
+                            <label for="width">Width</label>
+                            <input type="number" id="width" name="width" value="1024" min="256" max="2048" step="64">
+                            <div class="hint">SDXL default: 1024 (multiples of 64)</div>
+                        </div>
+
+                        <div class="form-group">
+                            <label for="height">Height</label>
+                            <input type="number" id="height" name="height" value="1024" min="256" max="2048" step="64">
+                            <div class="hint">SDXL default: 1024 (multiples of 64)</div>
+                        </div>
                     </div>
 
                     <div class="row">
@@ -471,11 +559,21 @@ async def index():
         const preview = document.getElementById('preview');
         const downloadLink = document.getElementById('download-link');
 
+        function setAspect(w, h) {{
+            document.getElementById('width').value = w;
+            document.getElementById('height').value = h;
+            document.querySelectorAll('.aspect-btn').forEach(btn => btn.classList.remove('active'));
+            event.target.classList.add('active');
+        }}
+
         form.addEventListener('submit', async (e) => {{
             e.preventDefault();
 
             const prompt = document.getElementById('prompt').value;
+            const negativePrompt = document.getElementById('negative-prompt').value;
             const filename = document.getElementById('filename').value;
+            const width = parseInt(document.getElementById('width').value);
+            const height = parseInt(document.getElementById('height').value);
             const steps = parseInt(document.getElementById('steps').value);
             const guidance = parseFloat(document.getElementById('guidance').value);
 
@@ -492,7 +590,10 @@ async def index():
             try {{
                 const formData = new FormData();
                 formData.append('prompt', prompt);
+                formData.append('negative_prompt', negativePrompt);
                 formData.append('filename', filename);
+                formData.append('width', width);
+                formData.append('height', height);
                 formData.append('num_inference_steps', steps);
                 formData.append('guidance_scale', guidance);
 
@@ -582,9 +683,12 @@ async def get_image(filename: str):
 @app.post("/generate-stream")
 async def generate_stream_form(
     prompt: str = Form(...),
+    negative_prompt: str = Form(""),
     filename: str = Form("output.png"),
     num_inference_steps: int = Form(30),
     guidance_scale: float = Form(7.5),
+    width: int = Form(0),
+    height: int = Form(0),
 ):
     """Form endpoint returning an SSE stream of generation status and final image URL."""
     return StreamingResponse(
@@ -593,6 +697,9 @@ async def generate_stream_form(
             steps=num_inference_steps,
             guidance=guidance_scale,
             filename=filename,
+            negative_prompt=negative_prompt or None,
+            width=width if width > 0 else None,
+            height=height if height > 0 else None,
         ),
         media_type="text/event-stream",
         headers={
@@ -612,6 +719,9 @@ async def generate_stream_api(request: GenerateRequest):
             steps=request.num_inference_steps,
             guidance=request.guidance_scale,
             filename=request.filename or "output.png",
+            negative_prompt=request.negative_prompt,
+            width=request.width,
+            height=request.height,
         ),
         media_type="text/event-stream",
         headers={
@@ -625,9 +735,12 @@ async def generate_stream_api(request: GenerateRequest):
 @app.post("/generate", response_class=Response)
 async def generate_image(
     prompt: str = Form(...),
+    negative_prompt: str = Form(""),
     filename: str = Form("output.png"),
     num_inference_steps: int = Form(30),
     guidance_scale: float = Form(7.5),
+    width: int = Form(0),
+    height: int = Form(0),
 ):
     """Accepts prompt, filename, and inference parameters, saves to disk and returns the PNG image."""
     if pipeline is None:
@@ -643,6 +756,9 @@ async def generate_image(
             steps=num_inference_steps,
             guidance=guidance_scale,
             save_path=save_path,
+            negative_prompt=negative_prompt or None,
+            width=width if width > 0 else None,
+            height=height if height > 0 else None,
         )
 
     return Response(
@@ -671,6 +787,9 @@ async def api_generate_image(request: GenerateRequest):
             steps=request.num_inference_steps,
             guidance=request.guidance_scale,
             save_path=save_path,
+            negative_prompt=request.negative_prompt,
+            width=request.width,
+            height=request.height,
         )
 
     return Response(
