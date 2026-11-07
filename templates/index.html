@@ -1,0 +1,626 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Text to Image Studio</title>
+    <style>
+        :root {
+            --bg-color: #0f172a;
+            --card-bg: #1e293b;
+            --accent: #6366f1;
+            --accent-hover: #4f46e5;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --border: #334155;
+            --input-bg: #0f172a;
+        }
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        }
+        body {
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 2rem 1rem;
+        }
+        .container {
+            width: 100%;
+            max-width: 1000px;
+        }
+        header {
+            text-align: center;
+            margin-bottom: 2rem;
+        }
+        h1 {
+            font-size: 2.25rem;
+            font-weight: 700;
+            margin-bottom: 0.5rem;
+            background: linear-gradient(135deg, #a5b4fc, #818cf8, #c084fc);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .badge {
+            display: inline-block;
+            background-color: rgba(99, 102, 241, 0.2);
+            color: #a5b4fc;
+            border: 1px solid rgba(99, 102, 241, 0.4);
+            border-radius: 9999px;
+            padding: 0.25rem 0.75rem;
+            font-size: 0.85rem;
+            margin-top: 0.5rem;
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 2rem;
+        }
+        @media (min-width: 768px) {
+            .grid {
+                grid-template-columns: 1fr 1fr;
+            }
+        }
+        .card {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 1rem;
+            padding: 1.5rem;
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.3);
+        }
+        .form-group {
+            margin-bottom: 1.25rem;
+        }
+        label {
+            display: block;
+            margin-bottom: 0.5rem;
+            font-weight: 500;
+            font-size: 0.95rem;
+            color: var(--text-main);
+        }
+        .hint {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            margin-top: 0.25rem;
+        }
+        textarea, input[type="text"], input[type="number"] {
+            width: 100%;
+            background: var(--input-bg);
+            border: 1px solid var(--border);
+            border-radius: 0.5rem;
+            color: var(--text-main);
+            padding: 0.75rem;
+            font-size: 0.95rem;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+        textarea:focus, input:focus {
+            border-color: var(--accent);
+        }
+        textarea {
+            resize: vertical;
+            min-height: 110px;
+        }
+        .row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1rem;
+        }
+        button {
+            width: 100%;
+            background: var(--accent);
+            color: white;
+            border: none;
+            border-radius: 0.5rem;
+            padding: 0.85rem;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s, transform 0.1s;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        button:hover {
+            background: var(--accent-hover);
+        }
+        button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+        .preview-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 380px;
+            background: var(--input-bg);
+            border: 2px dashed var(--border);
+            border-radius: 0.75rem;
+            position: relative;
+            overflow: hidden;
+            padding: 1rem;
+        }
+        .preview-image {
+            max-width: 100%;
+            max-height: 480px;
+            border-radius: 0.5rem;
+            display: none;
+            object-fit: contain;
+        }
+        .placeholder {
+            color: var(--text-muted);
+            text-align: center;
+            padding: 2rem;
+        }
+        .spinner {
+            display: none;
+            width: 40px;
+            height: 40px;
+            border: 4px solid rgba(255, 255, 255, 0.1);
+            border-top-color: var(--accent);
+            border-radius: 50%;
+            animation: spin 1s infinite linear;
+            margin-bottom: 1rem;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        .progress-bar-container {
+            display: none;
+            width: 80%;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 9999px;
+            height: 8px;
+            overflow: hidden;
+            margin-bottom: 1rem;
+        }
+        .progress-bar {
+            width: 0%;
+            height: 100%;
+            background: linear-gradient(90deg, #6366f1, #c084fc);
+            transition: width 0.2s ease;
+        }
+        .status-text {
+            font-size: 0.9rem;
+            color: var(--text-muted);
+            text-align: center;
+        }
+        .download-btn {
+            margin-top: 1rem;
+            display: none;
+            text-decoration: none;
+            background: #10b981;
+            color: white;
+            padding: 0.6rem 1.2rem;
+            border-radius: 0.5rem;
+            font-weight: 500;
+            text-align: center;
+            transition: background 0.2s;
+        }
+        .download-btn:hover {
+            background: #059669;
+        }
+        .aspect-btn {
+            background: var(--input-bg);
+            color: var(--text-main);
+            border: 1px solid var(--border);
+            border-radius: 0.5rem;
+            padding: 0.5rem;
+            font-size: 0.85rem;
+            cursor: pointer;
+            transition: all 0.2s;
+            width: 100%;
+        }
+        .aspect-btn:hover {
+            border-color: var(--accent);
+            background: rgba(99, 102, 241, 0.1);
+        }
+        .aspect-btn.active {
+            border-color: var(--accent);
+            background: rgba(99, 102, 241, 0.2);
+            color: #a5b4fc;
+        }
+
+        /* Gallery styles */
+        .gallery-section {
+            margin-top: 2rem;
+        }
+        .gallery-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1rem;
+        }
+        .gallery-header h2 {
+            font-size: 1.25rem;
+            font-weight: 600;
+            color: var(--text-main);
+        }
+        .gallery-refresh-btn {
+            background: var(--input-bg);
+            border: 1px solid var(--border);
+            color: var(--text-muted);
+            padding: 0.4rem 0.8rem;
+            border-radius: 0.5rem;
+            font-size: 0.85rem;
+            cursor: pointer;
+            transition: all 0.2s;
+            width: auto;
+        }
+        .gallery-refresh-btn:hover {
+            border-color: var(--accent);
+            color: var(--text-main);
+        }
+        .gallery-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+            gap: 1rem;
+        }
+        .gallery-item {
+            position: relative;
+            border-radius: 0.75rem;
+            overflow: hidden;
+            border: 1px solid var(--border);
+            background: var(--card-bg);
+            cursor: pointer;
+            transition: transform 0.2s, border-color 0.2s;
+        }
+        .gallery-item:hover {
+            transform: translateY(-2px);
+            border-color: var(--accent);
+        }
+        .gallery-item img {
+            width: 100%;
+            aspect-ratio: 1;
+            object-fit: cover;
+            display: block;
+        }
+        .gallery-item-info {
+            padding: 0.5rem;
+        }
+        .gallery-item-name {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .gallery-item-date {
+            font-size: 0.7rem;
+            color: var(--text-muted);
+            opacity: 0.7;
+            margin-top: 0.15rem;
+        }
+        .gallery-empty {
+            text-align: center;
+            padding: 2rem;
+            color: var(--text-muted);
+            font-size: 0.9rem;
+        }
+
+        /* Modal for gallery image preview */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.85);
+            z-index: 1000;
+            justify-content: center;
+            align-items: center;
+            cursor: pointer;
+        }
+        .modal-overlay.active {
+            display: flex;
+        }
+        .modal-overlay img {
+            max-width: 90%;
+            max-height: 90%;
+            border-radius: 0.5rem;
+            object-fit: contain;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Text to Image Studio</h1>
+            <p style="color: var(--text-muted);">Stable Diffusion XL Web Application with Live SSE Stream</p>
+            <div class="badge">Hardware Acceleration: {{ device_label }}</div>
+        </header>
+
+        <div class="grid">
+            <div class="card">
+                <form id="gen-form">
+                    <div class="form-group">
+                        <label for="prompt">Prompt</label>
+                        <textarea id="prompt" name="prompt" required placeholder="Describe what you want to see...">A cinematic shot of an astronaut riding a horse on Mars, highly detailed, 8k</textarea>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="negative-prompt">Negative Prompt</label>
+                        <textarea id="negative-prompt" name="negative_prompt" rows="2" placeholder="What to exclude: text, watermark, logo, dark, gloomy...">text, watermark, logo, blurry, low quality</textarea>
+                        <div class="hint">Things you don't want in the image — comma-separated works best.</div>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="filename">Filename</label>
+                        <input type="text" id="filename" name="filename" value="artwork.png" placeholder="e.g. artwork.png">
+                        <div class="hint">The generated image will be saved locally & returned with this name.</div>
+                    </div>
+
+                    <div class="form-group">
+                        <label>Aspect Ratio</label>
+                        <div class="row" style="grid-template-columns: 1fr 1fr 1fr;">
+                            <button type="button" class="aspect-btn active" onclick="setAspect(1024,1024)" style="font-size:0.85rem;padding:0.5rem;">1:1 Square</button>
+                            <button type="button" class="aspect-btn" onclick="setAspect(1344,768)" style="font-size:0.85rem;padding:0.5rem;">16:9 Wide</button>
+                            <button type="button" class="aspect-btn" onclick="setAspect(768,1344)" style="font-size:0.85rem;padding:0.5rem;">9:16 Tall</button>
+                        </div>
+                    </div>
+
+                    <div class="row">
+                        <div class="form-group">
+                            <label for="width">Width</label>
+                            <input type="number" id="width" name="width" value="1024" min="256" max="2048" step="64">
+                            <div class="hint">SDXL default: 1024 (multiples of 64)</div>
+                        </div>
+
+                        <div class="form-group">
+                            <label for="height">Height</label>
+                            <input type="number" id="height" name="height" value="1024" min="256" max="2048" step="64">
+                            <div class="hint">SDXL default: 1024 (multiples of 64)</div>
+                        </div>
+                    </div>
+
+                    <div class="row">
+                        <div class="form-group">
+                            <label for="steps">Inference Steps</label>
+                            <input type="number" id="steps" name="num_inference_steps" value="30" min="1" max="100">
+                            <div class="hint">Higher = more quality (25-40 typical)</div>
+                        </div>
+
+                        <div class="form-group">
+                            <label for="guidance">Guidance Scale</label>
+                            <input type="number" id="guidance" name="guidance_scale" value="7.5" step="0.5" min="0" max="20">
+                            <div class="hint">Higher = sticks closer to prompt (7-8 typical)</div>
+                        </div>
+                    </div>
+
+                    <button type="submit" id="submit-btn">
+                        <span>Generate Image</span>
+                    </button>
+                </form>
+            </div>
+
+            <div class="card" style="display: flex; flex-direction: column;">
+                <label>Generated Result</label>
+                <div class="preview-container">
+                    <div class="spinner" id="spinner"></div>
+                    <div class="progress-bar-container" id="progress-container">
+                        <div class="progress-bar" id="progress-bar"></div>
+                    </div>
+                    <div class="status-text" id="status-text">Your generated image will appear here</div>
+                    <img id="preview" class="preview-image" alt="Generated result" />
+                </div>
+                <a id="download-link" class="download-btn" download="generated_image.png">Download Image</a>
+            </div>
+        </div>
+
+        <!-- Image Gallery Section -->
+        <div class="gallery-section">
+            <div class="card">
+                <div class="gallery-header">
+                    <h2>Image Gallery</h2>
+                    <button type="button" class="gallery-refresh-btn" onclick="loadGallery()">Refresh</button>
+                </div>
+                <div id="gallery-grid" class="gallery-grid">
+                    <div class="gallery-empty">Loading gallery...</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal for full-size gallery image preview -->
+    <div class="modal-overlay" id="modal" onclick="closeModal()">
+        <img id="modal-img" src="" alt="Full size preview" />
+    </div>
+
+    <script>
+        const form = document.getElementById('gen-form');
+        const submitBtn = document.getElementById('submit-btn');
+        const spinner = document.getElementById('spinner');
+        const progressContainer = document.getElementById('progress-container');
+        const progressBar = document.getElementById('progress-bar');
+        const statusText = document.getElementById('status-text');
+        const preview = document.getElementById('preview');
+        const downloadLink = document.getElementById('download-link');
+
+        function setAspect(w, h) {
+            document.getElementById('width').value = w;
+            document.getElementById('height').value = h;
+            document.querySelectorAll('.aspect-btn').forEach(btn => btn.classList.remove('active'));
+            event.target.classList.add('active');
+        }
+
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+
+            const prompt = document.getElementById('prompt').value;
+            const negativePrompt = document.getElementById('negative-prompt').value;
+            const filename = document.getElementById('filename').value;
+            const width = parseInt(document.getElementById('width').value);
+            const height = parseInt(document.getElementById('height').value);
+            const steps = parseInt(document.getElementById('steps').value);
+            const guidance = parseFloat(document.getElementById('guidance').value);
+
+            // UI loading state
+            submitBtn.disabled = true;
+            spinner.style.display = 'block';
+            progressContainer.style.display = 'block';
+            progressBar.style.width = '0%';
+            statusText.style.display = 'block';
+            statusText.textContent = 'Connecting to server stream...';
+            preview.style.display = 'none';
+            downloadLink.style.display = 'none';
+
+            try {
+                const formData = new FormData();
+                formData.append('prompt', prompt);
+                formData.append('negative_prompt', negativePrompt);
+                formData.append('filename', filename);
+                formData.append('width', width);
+                formData.append('height', height);
+                formData.append('num_inference_steps', steps);
+                formData.append('guidance_scale', guidance);
+
+                const response = await fetch('generate-stream', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (!response.ok) {
+                    throw new Error('Server error: ' + response.status + ' ' + response.statusText);
+                }
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder('utf-8');
+                let buffer = '';
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop(); // keep last incomplete line
+
+                    for (const line of lines) {
+                        const trimmed = line.trim();
+                        if (trimmed.startsWith('data: ')) {
+                            const data = JSON.parse(trimmed.substring(6));
+
+                            if (data.status === 'queued') {
+                                statusText.textContent = data.message || 'Queued for generation...';
+                            } else if (data.status === 'starting') {
+                                statusText.textContent = data.message || 'Starting inference...';
+                                progressBar.style.width = '2%';
+                            } else if (data.status === 'generating') {
+                                statusText.textContent = `Denoising step ${data.step} of ${data.total_steps} (${data.percentage}%)`;
+                                progressBar.style.width = `${data.percentage}%`;
+                            } else if (data.status === 'saving') {
+                                statusText.textContent = data.message || 'Saving generated image...';
+                                progressBar.style.width = '100%';
+                            } else if (data.status === 'completed') {
+                                progressBar.style.width = '100%';
+                                statusText.textContent = 'Generation complete!';
+
+                                // Display image preview
+                                preview.src = data.image_url + '?t=' + new Date().getTime();
+                                preview.style.display = 'block';
+                                spinner.style.display = 'none';
+                                progressContainer.style.display = 'none';
+
+                                downloadLink.href = data.image_url;
+                                downloadLink.download = data.filename;
+                                downloadLink.style.display = 'inline-block';
+
+                                // Refresh gallery after successful generation
+                                loadGallery();
+                            } else if (data.status === 'error') {
+                                throw new Error(data.message || 'Unknown generation error');
+                            }
+                        }
+                    }
+                }
+            } catch (err) {
+                spinner.style.display = 'none';
+                progressContainer.style.display = 'none';
+                statusText.style.display = 'block';
+                statusText.textContent = 'Error: ' + err.message;
+            } finally {
+                submitBtn.disabled = false;
+            }
+        });
+
+        // Gallery functions
+        async function loadGallery() {
+            const grid = document.getElementById('gallery-grid');
+            grid.innerHTML = '<div class="gallery-empty">Loading gallery...</div>';
+
+            try {
+                const response = await fetch('/api/gallery');
+                if (!response.ok) {
+                    throw new Error('Failed to load gallery');
+                }
+                const images = await response.json();
+
+                if (images.length === 0) {
+                    grid.innerHTML = '<div class="gallery-empty">No images generated yet. Create your first image above!</div>';
+                    return;
+                }
+
+                grid.innerHTML = '';
+                images.forEach(img => {
+                    const item = document.createElement('div');
+                    item.className = 'gallery-item';
+                    item.onclick = () => openModal(img.url);
+
+                    const imageEl = document.createElement('img');
+                    imageEl.src = img.url + '?t=' + new Date().getTime();
+                    imageEl.alt = img.name;
+                    imageEl.loading = 'lazy';
+
+                    const info = document.createElement('div');
+                    info.className = 'gallery-item-info';
+
+                    const name = document.createElement('div');
+                    name.className = 'gallery-item-name';
+                    name.textContent = img.name;
+                    name.title = img.name;
+
+                    const date = document.createElement('div');
+                    date.className = 'gallery-item-date';
+                    date.textContent = img.modified;
+
+                    info.appendChild(name);
+                    info.appendChild(date);
+                    item.appendChild(imageEl);
+                    item.appendChild(info);
+                    grid.appendChild(item);
+                });
+            } catch (err) {
+                grid.innerHTML = '<div class="gallery-empty">Failed to load gallery.</div>';
+            }
+        }
+
+        function openModal(url) {
+            const modal = document.getElementById('modal');
+            const modalImg = document.getElementById('modal-img');
+            modalImg.src = url;
+            modal.classList.add('active');
+        }
+
+        function closeModal() {
+            document.getElementById('modal').classList.remove('active');
+        }
+
+        // Close modal on Escape key
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') closeModal();
+        });
+
+        // Load gallery on page load
+        loadGallery();
+    </script>
+</body>
+</html>
