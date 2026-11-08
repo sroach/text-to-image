@@ -558,7 +558,7 @@
             grid.innerHTML = '<div class="gallery-empty">Loading gallery...</div>';
 
             try {
-                const response = await fetch('/api/gallery');
+                const response = await fetch('api/gallery');
                 if (!response.ok) {
                     throw new Error('Failed to load gallery');
                 }

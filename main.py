@@ -4,23 +4,31 @@ import json
 import os
 import re
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import torch
 from diffusers import AutoPipelineForText2Image, AutoencoderKL
-from fastapi import FastAPI, Form, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 import uvicorn
+
+# Base directory — absolute path so it works regardless of working directory
+BASE_DIR = Path(__file__).resolve().parent
 
 # Global pipeline and lock
 pipeline = None
 generation_lock = asyncio.Lock()
 
 # Directory for saved outputs
-OUTPUT_DIR = Path("generated_images")
+OUTPUT_DIR = BASE_DIR / "generated_images"
 OUTPUT_DIR.mkdir(exist_ok=True)
+
+# Jinja2 templates
+templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 
 def get_optimal_device_and_dtype():
@@ -84,6 +92,7 @@ app = FastAPI(
     title="Text-to-Image Web App",
     description="Generate high quality images from text prompts using SDXL with real-time SSE streaming.",
     lifespan=lifespan,
+    root_path=os.environ.get("ROOT_PATH", ""),
 )
 
 
@@ -202,19 +211,30 @@ async def event_generator(
         while not task.done() or not progress_queue.empty():
             try:
                 progress = await asyncio.wait_for(progress_queue.get(), timeout=0.1)
+                # Pause BEFORE yielding so each SSE event is spaced out when sent to the client.
+                # On fast hardware (MPS/CUDA), all denoising steps complete nearly instantly and flood
+                # the queue. Without this delay, the browser receives all events in one TCP packet
+                # and only paints the final state, making the progress bar jump from 0% to 100%.
+                # 200ms per step gives a smooth ~6 second animation for 30 steps.
+                if progress.get("status") == "generating":
+                    await asyncio.sleep(0.2)
                 yield f"data: {json.dumps(progress)}\n\n"
             except asyncio.TimeoutError:
                 await asyncio.sleep(0.01)
 
         try:
+            # Signal that denoising is done and the image is being saved
+            yield f"data: {json.dumps({'status': 'saving', 'message': 'Saving generated image...', 'percentage': 100})}\n\n"
+
             await task
+
             completion = {
                 "status": "completed",
                 "step": steps,
                 "total_steps": steps,
                 "percentage": 100.0,
                 "filename": safe_filename,
-                "image_url": f"/images/{safe_filename}",
+                "image_url": f"images/{safe_filename}",
             }
             yield f"data: {json.dumps(completion)}\n\n"
         except Exception as e:
@@ -225,445 +245,19 @@ async def event_generator(
             yield f"data: {json.dumps(error_data)}\n\n"
 
 
-@app.get("/", response_class=HTMLResponse)
-async def index():
+@app.get("/")
+async def index(request: Request):
     """Web interface with prompt, filename, parameters, and interactive SSE stream preview."""
     device, dtype = get_optimal_device_and_dtype()
     device_label = "Apple Silicon (MPS)" if device == "mps" else ("NVIDIA GPU (CUDA)" if device == "cuda" else "CPU")
 
-    html_content = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Text to Image Studio</title>
-    <style>
-        :root {{
-            --bg-color: #0f172a;
-            --card-bg: #1e293b;
-            --accent: #6366f1;
-            --accent-hover: #4f46e5;
-            --text-main: #f8fafc;
-            --text-muted: #94a3b8;
-            --border: #334155;
-            --input-bg: #0f172a;
-        }}
-        * {{
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-        }}
-        body {{
-            background-color: var(--bg-color);
-            color: var(--text-main);
-            min-height: 100vh;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            padding: 2rem 1rem;
-        }}
-        .container {{
-            width: 100%;
-            max-width: 1000px;
-        }}
-        header {{
-            text-align: center;
-            margin-bottom: 2rem;
-        }}
-        h1 {{
-            font-size: 2.25rem;
-            font-weight: 700;
-            margin-bottom: 0.5rem;
-            background: linear-gradient(135deg, #a5b4fc, #818cf8, #c084fc);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-        }}
-        .badge {{
-            display: inline-block;
-            background-color: rgba(99, 102, 241, 0.2);
-            color: #a5b4fc;
-            border: 1px solid rgba(99, 102, 241, 0.4);
-            border-radius: 9999px;
-            padding: 0.25rem 0.75rem;
-            font-size: 0.85rem;
-            margin-top: 0.5rem;
-        }}
-        .grid {{
-            display: grid;
-            grid-template-columns: 1fr;
-            gap: 2rem;
-        }}
-        @media (min-width: 768px) {{
-            .grid {{
-                grid-template-columns: 1fr 1fr;
-            }}
-        }}
-        .card {{
-            background: var(--card-bg);
-            border: 1px solid var(--border);
-            border-radius: 1rem;
-            padding: 1.5rem;
-            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.3);
-        }}
-        .form-group {{
-            margin-bottom: 1.25rem;
-        }}
-        label {{
-            display: block;
-            margin-bottom: 0.5rem;
-            font-weight: 500;
-            font-size: 0.95rem;
-            color: var(--text-main);
-        }}
-        .hint {{
-            font-size: 0.8rem;
-            color: var(--text-muted);
-            margin-top: 0.25rem;
-        }}
-        textarea, input[type="text"], input[type="number"] {{
-            width: 100%;
-            background: var(--input-bg);
-            border: 1px solid var(--border);
-            border-radius: 0.5rem;
-            color: var(--text-main);
-            padding: 0.75rem;
-            font-size: 0.95rem;
-            outline: none;
-            transition: border-color 0.2s;
-        }}
-        textarea:focus, input:focus {{
-            border-color: var(--accent);
-        }}
-        textarea {{
-            resize: vertical;
-            min-height: 110px;
-        }}
-        .row {{
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 1rem;
-        }}
-        button {{
-            width: 100%;
-            background: var(--accent);
-            color: white;
-            border: none;
-            border-radius: 0.5rem;
-            padding: 0.85rem;
-            font-size: 1rem;
-            font-weight: 600;
-            cursor: pointer;
-            transition: background 0.2s, transform 0.1s;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            gap: 0.5rem;
-        }}
-        button:hover {{
-            background: var(--accent-hover);
-        }}
-        button:disabled {{
-            opacity: 0.6;
-            cursor: not-allowed;
-        }}
-        .preview-container {{
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            min-height: 380px;
-            background: var(--input-bg);
-            border: 2px dashed var(--border);
-            border-radius: 0.75rem;
-            position: relative;
-            overflow: hidden;
-            padding: 1rem;
-        }}
-        .preview-image {{
-            max-width: 100%;
-            max-height: 480px;
-            border-radius: 0.5rem;
-            display: none;
-            object-fit: contain;
-        }}
-        .placeholder {{
-            color: var(--text-muted);
-            text-align: center;
-            padding: 2rem;
-        }}
-        .spinner {{
-            display: none;
-            width: 40px;
-            height: 40px;
-            border: 4px solid rgba(255, 255, 255, 0.1);
-            border-top-color: var(--accent);
-            border-radius: 50%;
-            animation: spin 1s infinite linear;
-            margin-bottom: 1rem;
-        }}
-        @keyframes spin {{
-            0% {{ transform: rotate(0deg); }}
-            100% {{ transform: rotate(360deg); }}
-        }}
-        .progress-bar-container {{
-            display: none;
-            width: 80%;
-            background: rgba(255, 255, 255, 0.1);
-            border-radius: 9999px;
-            height: 8px;
-            overflow: hidden;
-            margin-bottom: 1rem;
-        }}
-        .progress-bar {{
-            width: 0%;
-            height: 100%;
-            background: linear-gradient(90deg, #6366f1, #c084fc);
-            transition: width 0.2s ease;
-        }}
-        .status-text {{
-            font-size: 0.9rem;
-            color: var(--text-muted);
-            text-align: center;
-        }}
-        .download-btn {{
-            margin-top: 1rem;
-            display: none;
-            text-decoration: none;
-            background: #10b981;
-            color: white;
-            padding: 0.6rem 1.2rem;
-            border-radius: 0.5rem;
-            font-weight: 500;
-            text-align: center;
-            transition: background 0.2s;
-        }}
-        .download-btn:hover {{
-            background: #059669;
-        }}
-        .aspect-btn {{
-            background: var(--input-bg);
-            color: var(--text-main);
-            border: 1px solid var(--border);
-            border-radius: 0.5rem;
-            padding: 0.5rem;
-            font-size: 0.85rem;
-            cursor: pointer;
-            transition: all 0.2s;
-            width: 100%;
-        }}
-        .aspect-btn:hover {{
-            border-color: var(--accent);
-            background: rgba(99, 102, 241, 0.1);
-        }}
-        .aspect-btn.active {{
-            border-color: var(--accent);
-            background: rgba(99, 102, 241, 0.2);
-            color: #a5b4fc;
-        }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <header>
-            <h1>Text to Image Studio</h1>
-            <p style="color: var(--text-muted);">Stable Diffusion XL Web Application with Live SSE Stream</p>
-            <div class="badge">Hardware Acceleration: {device_label}</div>
-        </header>
-
-        <div class="grid">
-            <div class="card">
-                <form id="gen-form">
-                    <div class="form-group">
-                        <label for="prompt">Prompt</label>
-                        <textarea id="prompt" name="prompt" required placeholder="Describe what you want to see...">A cinematic shot of an astronaut riding a horse on Mars, highly detailed, 8k</textarea>
-                    </div>
-
-                    <div class="form-group">
-                        <label for="negative-prompt">Negative Prompt</label>
-                        <textarea id="negative-prompt" name="negative_prompt" rows="2" placeholder="What to exclude: text, watermark, logo, dark, gloomy...">text, watermark, logo, blurry, low quality</textarea>
-                        <div class="hint">Things you don't want in the image — comma-separated works best.</div>
-                    </div>
-
-                    <div class="form-group">
-                        <label for="filename">Filename</label>
-                        <input type="text" id="filename" name="filename" value="artwork.png" placeholder="e.g. artwork.png">
-                        <div class="hint">The generated image will be saved locally & returned with this name.</div>
-                    </div>
-
-                    <div class="form-group">
-                        <label>Aspect Ratio</label>
-                        <div class="row" style="grid-template-columns: 1fr 1fr 1fr;">
-                            <button type="button" class="aspect-btn" onclick="setAspect(1024,1024)" style="font-size:0.85rem;padding:0.5rem;">1:1 Square</button>
-                            <button type="button" class="aspect-btn" onclick="setAspect(1344,768)" style="font-size:0.85rem;padding:0.5rem;">16:9 Wide</button>
-                            <button type="button" class="aspect-btn" onclick="setAspect(768,1344)" style="font-size:0.85rem;padding:0.5rem;">9:16 Tall</button>
-                        </div>
-                    </div>
-
-                    <div class="row">
-                        <div class="form-group">
-                            <label for="width">Width</label>
-                            <input type="number" id="width" name="width" value="1024" min="256" max="2048" step="64">
-                            <div class="hint">SDXL default: 1024 (multiples of 64)</div>
-                        </div>
-
-                        <div class="form-group">
-                            <label for="height">Height</label>
-                            <input type="number" id="height" name="height" value="1024" min="256" max="2048" step="64">
-                            <div class="hint">SDXL default: 1024 (multiples of 64)</div>
-                        </div>
-                    </div>
-
-                    <div class="row">
-                        <div class="form-group">
-                            <label for="steps">Inference Steps</label>
-                            <input type="number" id="steps" name="num_inference_steps" value="30" min="1" max="100">
-                            <div class="hint">Higher = more quality (25-40 typical)</div>
-                        </div>
-
-                        <div class="form-group">
-                            <label for="guidance">Guidance Scale</label>
-                            <input type="number" id="guidance" name="guidance_scale" value="7.5" step="0.5" min="0" max="20">
-                            <div class="hint">Higher = sticks closer to prompt (7-8 typical)</div>
-                        </div>
-                    </div>
-
-                    <button type="submit" id="submit-btn">
-                        <span>Generate Image</span>
-                    </button>
-                </form>
-            </div>
-
-            <div class="card" style="display: flex; flex-direction: column;">
-                <label>Generated Result</label>
-                <div class="preview-container">
-                    <div class="spinner" id="spinner"></div>
-                    <div class="progress-bar-container" id="progress-container">
-                        <div class="progress-bar" id="progress-bar"></div>
-                    </div>
-                    <div class="status-text" id="status-text">Your generated image will appear here</div>
-                    <img id="preview" class="preview-image" alt="Generated result" />
-                </div>
-                <a id="download-link" class="download-btn" download="generated_image.png">Download Image</a>
-            </div>
-        </div>
-    </div>
-
-    <script>
-        const form = document.getElementById('gen-form');
-        const submitBtn = document.getElementById('submit-btn');
-        const spinner = document.getElementById('spinner');
-        const progressContainer = document.getElementById('progress-container');
-        const progressBar = document.getElementById('progress-bar');
-        const statusText = document.getElementById('status-text');
-        const preview = document.getElementById('preview');
-        const downloadLink = document.getElementById('download-link');
-
-        function setAspect(w, h) {{
-            document.getElementById('width').value = w;
-            document.getElementById('height').value = h;
-            document.querySelectorAll('.aspect-btn').forEach(btn => btn.classList.remove('active'));
-            event.target.classList.add('active');
-        }}
-
-        form.addEventListener('submit', async (e) => {{
-            e.preventDefault();
-
-            const prompt = document.getElementById('prompt').value;
-            const negativePrompt = document.getElementById('negative-prompt').value;
-            const filename = document.getElementById('filename').value;
-            const width = parseInt(document.getElementById('width').value);
-            const height = parseInt(document.getElementById('height').value);
-            const steps = parseInt(document.getElementById('steps').value);
-            const guidance = parseFloat(document.getElementById('guidance').value);
-
-            // UI loading state
-            submitBtn.disabled = true;
-            spinner.style.display = 'block';
-            progressContainer.style.display = 'block';
-            progressBar.style.width = '0%';
-            statusText.style.display = 'block';
-            statusText.textContent = 'Connecting to server stream...';
-            preview.style.display = 'none';
-            downloadLink.style.display = 'none';
-
-            try {{
-                const formData = new FormData();
-                formData.append('prompt', prompt);
-                formData.append('negative_prompt', negativePrompt);
-                formData.append('filename', filename);
-                formData.append('width', width);
-                formData.append('height', height);
-                formData.append('num_inference_steps', steps);
-                formData.append('guidance_scale', guidance);
-
-                const response = await fetch('/generate-stream', {{
-                    method: 'POST',
-                    body: formData
-                }});
-
-                if (!response.ok) {{
-                    throw new Error('Server error: ' + response.status + ' ' + response.statusText);
-                }}
-
-                const reader = response.body.getReader();
-                const decoder = new TextDecoder('utf-8');
-                let buffer = '';
-
-                while (true) {{
-                    const {{ done, value }} = await reader.read();
-                    if (done) break;
-
-                    buffer += decoder.decode(value, {{ stream: true }});
-                    const lines = buffer.split('\\n');
-                    buffer = lines.pop(); // keep last incomplete line
-
-                    for (const line of lines) {{
-                        const trimmed = line.trim();
-                        if (trimmed.startsWith('data: ')) {{
-                            const data = JSON.parse(trimmed.substring(6));
-
-                            if (data.status === 'queued') {{
-                                statusText.textContent = data.message || 'Queued for generation...';
-                            }} else if (data.status === 'starting') {{
-                                statusText.textContent = data.message || 'Starting inference...';
-                                progressBar.style.width = '2%';
-                            }} else if (data.status === 'generating') {{
-                                statusText.textContent = `Denoising step ${{data.step}} of ${{data.total_steps}} (${{data.percentage}}%)`;
-                                progressBar.style.width = `${{data.percentage}}%`;
-                            }} else if (data.status === 'completed') {{
-                                progressBar.style.width = '100%';
-                                statusText.textContent = 'Generation complete!';
-                                
-                                // Display image preview
-                                preview.src = data.image_url + '?t=' + new Date().getTime();
-                                preview.style.display = 'block';
-                                spinner.style.display = 'none';
-                                progressContainer.style.display = 'none';
-
-                                downloadLink.href = data.image_url;
-                                downloadLink.download = data.filename;
-                                downloadLink.style.display = 'inline-block';
-                            }} else if (data.status === 'error') {{
-                                throw new Error(data.message || 'Unknown generation error');
-                            }}
-                        }}
-                    }}
-                }}
-            }} catch (err) {{
-                spinner.style.display = 'none';
-                progressContainer.style.display = 'none';
-                statusText.style.display = 'block';
-                statusText.textContent = 'Error: ' + err.message;
-            }} finally {{
-                submitBtn.disabled = false;
-            }}
-        }});
-    </script>
-</body>
-</html>
-"""
-    return HTMLResponse(content=html_content)
+    return templates.TemplateResponse(
+        request,
+        "index.html",
+        {
+            "device_label": device_label,
+        },
+    )
 
 
 @app.get("/images/{filename}")
@@ -678,6 +272,26 @@ async def get_image(filename: str):
         media_type="image/png",
         filename=safe_filename,
     )
+
+
+@app.get("/api/gallery")
+async def gallery():
+    """List all generated images with metadata for the gallery view."""
+    images = []
+    for img_path in OUTPUT_DIR.iterdir():
+        if img_path.suffix.lower() == ".png":
+            stat = img_path.stat()
+            modified = datetime.fromtimestamp(stat.st_mtime)
+            modified_str = modified.strftime("%Y-%m-%d %H:%M")
+            images.append({
+                "name": img_path.name,
+                "url": f"/images/{img_path.name}",
+                "modified": modified_str,
+                "size": stat.st_size,
+            })
+    # Sort by modification time, newest first
+    images.sort(key=lambda x: x["modified"], reverse=True)
+    return images
 
 
 @app.post("/generate-stream")
@@ -704,7 +318,6 @@ async def generate_stream_form(
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         },
     )
@@ -726,7 +339,6 @@ async def generate_stream_api(request: GenerateRequest):
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         },
     )
