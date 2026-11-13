@@ -107,7 +107,7 @@ async def index():
     return HTMLResponse(html)
 
 
-@app.post("generate")
+@app.post("/generate")
 async def generate(req: GenerateRequest):
     """Start image generation and return a request_id for SSE progress tracking."""
     if _model is None:
@@ -191,7 +191,7 @@ async def generate(req: GenerateRequest):
     return {"request_id": request_id}
 
 
-@app.get("progress/{request_id}")
+@app.get("/progress/{request_id}")
 async def progress(request_id: str):
     """SSE endpoint: streams progress updates for the given request."""
     q = _progress_queues.get(request_id)
@@ -223,7 +223,7 @@ async def progress(request_id: str):
     )
 
 
-@app.get("result/{request_id}")
+@app.get("/result/{request_id}")
 async def result(request_id: str):
     """Poll endpoint: returns the final result once generation is complete."""
     res = _results.get(request_id)
@@ -236,7 +236,7 @@ async def result(request_id: str):
     return res
 
 
-@app.get("output/{filename}")
+@app.get("/output/{filename}")
 async def get_output(filename: str):
     """Serve a generated image from the output directory."""
     path = OUTPUT_DIR / filename
@@ -248,7 +248,7 @@ async def get_output(filename: str):
 def main():
     """Entry point: start the uvicorn server."""
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=7002)
+    uvicorn.run(app, host="0.0.0.0", port=7002, root_path="/text-2-image")
 
 
 if __name__ == "__main__":
