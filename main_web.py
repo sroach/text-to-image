@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import io
+import queue
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -29,8 +30,8 @@ _model_loading = False
 # SSE progress infrastructure
 # ---------------------------------------------------------------------------
 
-# Per-request progress queues: request_id -> asyncio.Queue
-_progress_queues: dict[str, asyncio.Queue] = {}
+# Per-request progress queues: request_id -> queue.Queue (thread-safe, sync)
+_progress_queues: dict[str, queue.Queue] = {}
 
 # Completed results: request_id -> result dict or error info
 _results: dict[str, dict[str, Any]] = {}
@@ -57,7 +58,7 @@ class ProgressCallback:
             progress = int((t + 1) / self.total_steps * 100)
             try:
                 q.put_nowait(f"data: {progress}\n\n")
-            except asyncio.QueueFull:
+            except queue.Full:
                 pass  # client disconnected or slow
 
 
@@ -116,8 +117,8 @@ async def generate(req: GenerateRequest):
     request_id = str(uuid.uuid4())
     seed = req.seed if req.seed is not None else int(time.time()) % (2**32)
 
-    # Set up SSE queue for this request
-    q: asyncio.Queue = asyncio.Queue(maxsize=100)
+    # Set up SSE queue for this request (thread-safe sync queue)
+    q: queue.Queue = queue.Queue(maxsize=100)
     _progress_queues[request_id] = q
     q.put_nowait("data: 0\n\n")  # initial progress
 
@@ -199,11 +200,15 @@ async def progress(request_id: str):
     async def event_stream():
         try:
             while True:
-                message = await asyncio.wait_for(q.get(), timeout=60)
+                # Read from the sync queue in a thread pool to avoid blocking the event loop
+                message = await asyncio.wait_for(
+                    asyncio.to_thread(q.get, timeout=60),
+                    timeout=65
+                )
                 yield message
                 if message == "data: [DONE]\n\n":
                     break
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, queue.Empty):
             yield 'data: {"error": "Generation timed out"}\n\n'
         except asyncio.CancelledError:
             pass
