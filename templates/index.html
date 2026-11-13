@@ -145,6 +145,28 @@
     color: var(--muted);
     margin-top: .25rem;
   }
+  .progress-bar-container {
+    display: none;
+    width: 100%;
+    height: 6px;
+    background: var(--border);
+    border-radius: 3px;
+    overflow: hidden;
+    margin-top: .5rem;
+  }
+  .progress-bar-fill {
+    height: 100%;
+    width: 0%;
+    background: var(--accent);
+    border-radius: 3px;
+    transition: width 0.3s ease;
+  }
+  .progress-text {
+    font-size: .8rem;
+    color: var(--muted);
+    margin-top: .25rem;
+    text-align: center;
+  }
 </style>
 </head>
 <body>
@@ -204,6 +226,10 @@
       </div>
 
       <button id="generate_btn" onclick="generate()">Generate Image</button>
+      <div class="progress-bar-container" id="progress_container">
+        <div class="progress-bar-fill" id="progress_fill"></div>
+      </div>
+      <p class="progress-text" id="progress_text"></p>
     </div>
 
     <!-- Right: Preview -->
@@ -232,6 +258,9 @@ async function generate() {
   const img = document.getElementById('result_img');
   const meta = document.getElementById('meta');
   const dl = document.getElementById('download_btn');
+  const progressContainer = document.getElementById('progress_container');
+  const progressFill = document.getElementById('progress_fill');
+  const progressText = document.getElementById('progress_text');
 
   const payload = {
     prompt: document.getElementById('prompt').value.trim(),
@@ -255,7 +284,14 @@ async function generate() {
   meta.innerHTML = '';
   dl.style.display = 'none';
 
+  // Reset progress bar
+  progressContainer.style.display = 'block';
+  progressFill.style.width = '0%';
+  progressText.textContent = 'Starting generation…';
+
+  let eventSource = null;
   try {
+    // Start generation
     const res = await fetch('generate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -265,16 +301,86 @@ async function generate() {
       const err = await res.json().catch(() => ({ detail: res.statusText }));
       throw new Error(err.detail || 'Generation failed');
     }
-    const data = await res.json();
+    const { request_id } = await res.json();
 
+    // Open SSE connection for progress updates
+    eventSource = new EventSource('progress/' + request_id);
+
+    // Wait for SSE to signal completion
+    await new Promise((resolve, reject) => {
+      let resolved = false;
+      const ensureResolved = (val) => { if (!resolved) { resolved = true; val; } };
+
+      eventSource.onmessage = (event) => {
+        // Check for error message
+        if (event.data.startsWith('{')) {
+          try {
+            const parsed = JSON.parse(event.data);
+            if (parsed.error) {
+              eventSource.close();
+              reject(new Error(parsed.error));
+              return;
+            }
+          } catch (e) {
+            // ignore JSON parse errors for non-JSON data
+          }
+        }
+
+        // Check for done signal
+        if (event.data === '[DONE]') {
+          eventSource.close();
+          ensureResolved(resolve());
+          return;
+        }
+
+        // Update progress bar
+        const progress = parseInt(event.data);
+        if (!isNaN(progress)) {
+          progressFill.style.width = progress + '%';
+          progressText.textContent = 'Generating… ' + progress + '%';
+        }
+      };
+
+      eventSource.onerror = (event) => {
+        eventSource.close();
+        // SSE errors are expected when the stream closes normally —
+        // only reject if we haven't already resolved via [DONE]
+        if (!resolved) {
+          reject(new Error('Connection lost during generation'));
+        }
+      };
+
+      // Timeout after 10 minutes
+      setTimeout(() => {
+        if (!resolved) {
+          eventSource.close();
+          reject(new Error('Generation timed out'));
+        }
+      }, 600000);
+    });
+
+    // Fetch the final result
+    const resultRes = await fetch('result/' + request_id);
+    if (!resultRes.ok) {
+      const err = await resultRes.json().catch(() => ({ detail: resultRes.statusText }));
+      throw new Error(err.detail || 'Failed to fetch result');
+    }
+    const data = await resultRes.json();
+
+    // Display result
     img.src = 'data:image/png;base64,' + data.base64;
     img.style.display = 'block';
     meta.innerHTML = `Seed: <span>${data.seed}</span> &middot; Time: <span>${data.elapsed_seconds}s</span> &middot; Size: <span>${data.width}×${data.height}</span>`;
     dl.href = data.url;
     dl.style.display = 'inline-block';
+    progressFill.style.width = '100%';
+    progressText.textContent = 'Complete!';
+
   } catch (e) {
+    if (eventSource) eventSource.close();
     placeholder.textContent = '❌ ' + e.message;
     placeholder.style.display = 'block';
+    progressText.textContent = 'Error: ' + e.message;
   } finally {
     spinner.style.display = 'none';
     btn.disabled = false;
