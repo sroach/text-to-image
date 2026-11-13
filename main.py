@@ -285,7 +285,7 @@ async def gallery():
             modified_str = modified.strftime("%Y-%m-%d %H:%M")
             images.append({
                 "name": img_path.name,
-                "url": f"/images/{img_path.name}",
+                "url": f"images/{img_path.name}",
                 "modified": modified_str,
                 "size": stat.st_size,
             })
