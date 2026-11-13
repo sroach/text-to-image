@@ -144,7 +144,6 @@ async def generate(req: GenerateRequest):
             except asyncio.QueueFull:
                 pass
             _model.callbacks.in_loop.remove(callback)
-            _progress_queues.pop(request_id, None)
             return
 
         elapsed = time.time() - start
@@ -182,9 +181,8 @@ async def generate(req: GenerateRequest):
         except asyncio.QueueFull:
             pass
 
-        # Cleanup
+        # Cleanup callback only — SSE endpoint cleans up the queue
         _model.callbacks.in_loop.remove(callback)
-        _progress_queues.pop(request_id, None)
 
     asyncio.create_task(run_generation())
 
