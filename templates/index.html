@@ -256,7 +256,7 @@ async function generate() {
   dl.style.display = 'none';
 
   try {
-    const res = await fetch('/generate', {
+    const res = await fetch('generate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
