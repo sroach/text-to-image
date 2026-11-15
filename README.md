@@ -2,6 +2,15 @@
 
 Generate high-quality images from text prompts using **Stable Diffusion XL (SDXL)** via a FastAPI web application.
 
+## Run
+
+```bash 
+source .venv/bin/activate
+
+uvicorn main_web:app --port 7070 --reload
+```
+
+
 ## Features
 
 - **SDXL Model**: Uses `stabilityai/stable-diffusion-xl-base-1.0` for high-quality image generation
